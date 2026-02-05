@@ -1,1 +1,388 @@
+!pip install google-genai seaborn tabulate --quiet
 
+import os
+from pathlib import Path
+from datetime import datetime
+import json
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from IPython.display import display
+from tabulate import tabulate
+
+from google import genai
+
+sns.set(style="whitegrid")
+pd.set_option("display.max_columns", 200)
+pd.set_option("display.width", 140)
+
+BASE_OUTPUT = Path("auto_output")
+BASE_OUTPUT.mkdir(parents=True, exist_ok=True)
+
+MISSING_FLAG_THRESHOLD = 0.5
+CAT_MAX_LEVELS = 20
+DATETIME_SUCCESS_RATIO = 0.75
+LLM_MODEL = "gemini-3-flash-preview"
+
+
+DEFAULT_MISSING_TOKENS = {
+    "", " ", "na", "n/a", "nan", "null", "none", "unknown", "?",
+    "-", "--", "missing", "-999", "-9999", "999", "9999"
+}
+
+def read_dataset_india() -> pd.DataFrame:
+    """
+    Always reads 'india_population.csv' from the current working directory.
+    """
+    csv_path = "india_population.csv"
+    if not Path(csv_path).exists():
+        raise FileNotFoundError(f"Could not find {csv_path} in current directory.")
+    df = pd.read_csv(csv_path, low_memory=False)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+def normalize_missing(df: pd.DataFrame) -> pd.DataFrame:
+    tokens = {t.lower() for t in DEFAULT_MISSING_TOKENS}
+    for col in df.columns:
+        if df[col].dtype == "object":
+            s = df[col].astype(str).str.strip()
+            df[col] = s.mask(s.str.lower().isin(tokens))
+    # convert nearly numeric columns
+    for col in df.columns:
+        if df[col].dtype == "object":
+            num = pd.to_numeric(df[col], errors="coerce")
+            if num.notna().mean() > 0.9:
+                df[col] = num
+    return df
+
+def infer_roles(df: pd.DataFrame) -> dict:
+    roles = {}
+    n = len(df)
+    for col in df.columns:
+        s = df[col]
+        if pd.api.types.is_numeric_dtype(s):
+            roles[col] = "numeric"
+            continue
+        if s.dtype == "object":
+            parsed = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
+            if parsed.notna().mean() >= DATETIME_SUCCESS_RATIO:
+                df[col] = parsed
+                roles[col] = "datetime"
+                continue
+            nunique = s.nunique(dropna=True)
+            if nunique <= CAT_MAX_LEVELS:
+                roles[col] = "categorical"
+            elif nunique > 0.5 * n:
+                roles[col] = "text"
+            else:
+                roles[col] = "categorical"
+        else:
+            roles[col] = "other"
+    return roles
+
+def run_quality_checks(df: pd.DataFrame, roles: dict) -> dict:
+    n_rows, n_cols = df.shape
+    dup_rows = int(df.duplicated().sum())
+    miss_cnt = df.isna().sum()
+    miss_frac = df.isna().mean()
+    const_cols = [c for c in df.columns if df[c].nunique(dropna=True) <= 1]
+    high_missing = [c for c in df.columns if miss_frac[c] > MISSING_FLAG_THRESHOLD]
+    id_like = []
+    for c in df.columns:
+        if roles.get(c) != "numeric":
+            if df[c].nunique(dropna=True) > 0.9 * n_rows:
+                id_like.append(c)
+    return {
+        "n_rows": int(n_rows),
+        "n_cols": int(n_cols),
+        "duplicate_rows": dup_rows,
+        "missing_count": miss_cnt.to_dict(),
+        "missing_fraction": miss_frac.to_dict(),
+        "constant_cols": const_cols,
+        "high_missing_cols": high_missing,
+        "id_like_cols": id_like,
+        "missing_threshold": MISSING_FLAG_THRESHOLD,
+    }
+
+def pick_categorical_column(df: pd.DataFrame, roles: dict) -> str | None:
+    candidates = [c for c, r in roles.items() if r == "categorical"]
+    if not candidates:
+        return None
+    candidates = sorted(
+        candidates,
+        key=lambda c: (df[c].nunique(dropna=True), -df[c].notna().sum())
+    )
+    return candidates[0]
+
+def categorical_profile(df: pd.DataFrame, col: str, top_k: int = 15) -> pd.DataFrame:
+    vc = df[col].value_counts(dropna=False)
+    total = vc.sum()
+    out = (
+        vc.to_frame("count")
+        .assign(percent=lambda d: (d["count"] / total * 100).round(2))
+        .reset_index()
+        .rename(columns={"index": col})
+    )
+    return out.head(top_k)
+
+def numeric_profiles(df: pd.DataFrame, roles: dict) -> list[dict]:
+    stats = []
+    for col, r in roles.items():
+        if r != "numeric":
+            continue
+        s = df[col].dropna()
+        if s.empty:
+            continue
+        q1 = s.quantile(0.25)
+        q3 = s.quantile(0.75)
+        iqr = q3 - q1
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        outliers = int(((s < lower) | (s > upper)).sum())
+        mode_vals = s.mode()
+        mode_val = float(mode_vals.iloc[0]) if not mode_vals.empty else None
+        stats.append(
+            {
+                "column": col,
+                "count": int(s.count()),
+                "mean": float(s.mean()),
+                "std": float(s.std()),
+                "min": float(s.min()),
+                "q1": float(q1),
+                "median": float(s.median()),
+                "q3": float(q3),
+                "max": float(s.max()),
+                "iqr": float(iqr),
+                "lower_1_5_iqr": float(lower),
+                "upper_1_5_iqr": float(upper),
+                "n_outliers_1_5_iqr": outliers,
+                "mode": mode_val,
+            }
+        )
+    return stats
+
+def generate_plots_india(df: pd.DataFrame, roles: dict) -> list[Path]:
+    dataset_name = "india_population"
+    plot_dir = BASE_OUTPUT / dataset_name / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    numeric_cols = [c for c, r in roles.items() if r == "numeric"]
+    cat_cols = [c for c, r in roles.items() if r == "categorical"]
+
+    paths: list[Path] = []
+
+    # 1) Histogram
+    if numeric_cols:
+        col = numeric_cols[0]
+        fig, ax = plt.subplots(figsize=(6, 4))
+        sns.histplot(df[col], kde=True, ax=ax)
+        ax.set_title(f"Histogram of {col}")
+        ax.set_xlabel(col)
+        ax.set_ylabel("Count")
+        p = plot_dir / f"{dataset_name}_hist_{col}.png"
+        fig.tight_layout()
+        fig.savefig(p, dpi=130)
+        plt.show()
+        paths.append(p)
+
+    # 2) Boxplot
+    if numeric_cols:
+        col = numeric_cols[0]
+        fig, ax = plt.subplots(figsize=(4, 4))
+        sns.boxplot(x=df[col], ax=ax)
+        ax.set_title(f"Boxplot of {col}")
+        ax.set_xlabel(col)
+        p = plot_dir / f"{dataset_name}_box_{col}.png"
+        fig.tight_layout()
+        fig.savefig(p, dpi=130)
+        plt.show()
+        paths.append(p)
+
+    # 3) Bar chart
+    if cat_cols:
+        col = cat_cols[0]
+        vc = df[col].value_counts().head(15)
+        fig, ax = plt.subplots(figsize=(7, 4))
+        sns.barplot(x=vc.index.astype(str), y=vc.values, ax=ax)
+        ax.set_title(f"Top categories in {col}")
+        ax.set_xlabel(col)
+        ax.set_ylabel("Count")
+        ax.tick_params(axis="x", rotation=45)
+        p = plot_dir / f"{dataset_name}_bar_{col}.png"
+        fig.tight_layout()
+        fig.savefig(p, dpi=130)
+        plt.show()
+        paths.append(p)
+
+    # 4) Scatter
+    if len(numeric_cols) >= 2:
+        xcol, ycol = numeric_cols[:2]
+        fig, ax = plt.subplots(figsize=(6, 4))
+        sns.scatterplot(x=df[xcol], y=df[ycol], ax=ax, alpha=0.6)
+        ax.set_title(f"{xcol} vs {ycol}")
+        ax.set_xlabel(xcol)
+        ax.set_ylabel(ycol)
+        p = plot_dir / f"{dataset_name}_scatter_{xcol}_vs_{ycol}.png"
+        fig.tight_layout()
+        fig.savefig(p, dpi=130)
+        plt.show()
+        paths.append(p)
+
+    # 5) Correlation heatmap
+    if len(numeric_cols) >= 2:
+        corr = df[numeric_cols].corr()
+        fig, ax = plt.subplots(figsize=(max(6, len(numeric_cols)), 6))
+        sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm", ax=ax)
+        ax.set_title("Correlation heatmap")
+        p = plot_dir / f"{dataset_name}_corr.png"
+        fig.tight_layout()
+        fig.savefig(p, dpi=130)
+        plt.show()
+        paths.append(p)
+
+    return paths
+
+def build_gemini_client() -> genai.Client:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Set GEMINI_API_KEY environment variable first.")
+    return genai.Client(api_key=api_key)
+
+def make_insights_with_llm(
+    client: genai.Client,
+    overview: dict,
+    roles: dict,
+    quality: dict,
+    cat_col: str | None,
+    cat_table: pd.DataFrame | None,
+    numeric_stats: list[dict],
+) -> dict:
+    payload = {
+        "dataset": "india_population",
+        "overview": overview,
+        "roles": roles,
+        "quality": quality,
+        "categorical": {
+            "column": cat_col,
+            "table": cat_table.to_dict(orient="records") if cat_table is not None else None,
+        },
+        "numeric": numeric_stats,
+    }
+
+    prompt = f"""
+You are summarizing an EDA for a dataset called india_population.
+All numbers are precomputed in this JSON; do not invent new numeric values.
+
+Return:
+- 5–10 bullet-point insights.
+- 1 short paragraph on limitations or potential bias.
+
+JSON:
+{json.dumps(payload, indent=2)}
+"""
+
+    resp = client.models.generate_content(
+        model=LLM_MODEL,
+        contents=prompt,
+    )
+    text = resp.text or ""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    bullets = [l.lstrip("-*• ") for l in lines if l.startswith(("-", "*", "•"))]
+    other = [l for l in lines if not l.startswith(("-", "*", "•"))]
+
+    bullets = bullets[:10]
+    while len(bullets) < 5:
+        bullets.append("More detailed insights would require richer numeric or categorical coverage.")
+
+    limitations = " ".join(other) if other else "Results may be limited by missing data, sampling, and potential identifier-like fields."
+
+    return {"insights": bullets, "limitations": limitations}
+
+def run_india_population_eda():
+    print("Running EDA for india_population.csv")
+
+    # 1. Load
+    df = read_dataset_india()
+    df = normalize_missing(df)
+
+    print("\nData preview:")
+    display(df.head())
+
+    # 2. Roles and quality
+    roles = infer_roles(df)
+    print("\nInferred roles:")
+    print(roles)
+
+    quality = run_quality_checks(df, roles)
+    print("\nQuality checks:")
+    qual_df = pd.DataFrame({
+        "missing_count": quality["missing_count"],
+        "missing_pct": {k: v * 100 for k, v in quality["missing_fraction"].items()}
+    })
+    display(qual_df)
+
+    # 3. Descriptive stats
+    cat_col = pick_categorical_column(df, roles)
+    if cat_col:
+        cat_table = categorical_profile(df, cat_col)
+        print(f"\nCategorical summary for '{cat_col}':")
+        display(cat_table)
+    else:
+        cat_table = None
+        print("\nNo suitable categorical column found.")
+
+    numeric_stats = numeric_profiles(df, roles)
+    print("\nNumeric summaries:")
+    display(pd.DataFrame(numeric_stats))
+
+    # 4. Plots
+    print("\nGenerating plots...")
+    plot_paths = generate_plots_india(df, roles)
+    print("Saved plots:")
+    for p in plot_paths:
+        print("-", p)
+
+    # 5. Gemini insights
+    overview = {
+        "n_rows": df.shape[0],
+        "n_cols": df.shape[1],
+        "columns": list(df.columns),
+    }
+
+    print("\nCalling Gemini for insights...")
+    client = build_gemini_client()
+    llm_block = make_insights_with_llm(
+        client,
+        overview=overview,
+        roles=roles,
+        quality=quality,
+        cat_col=cat_col,
+        cat_table=cat_table,
+        numeric_stats=numeric_stats,
+    )
+
+    print("\nInsights:")
+    for b in llm_block["insights"]:
+        print("-", b)
+
+    print("\nLimitations:")
+    print(llm_block["limitations"])
+
+    # 6. Save simple text report
+    ds_dir = BASE_OUTPUT / "india_population"
+    ds_dir.mkdir(parents=True, exist_ok=True)
+    report_path = ds_dir / "eda_report.txt"
+    with report_path.open("w", encoding="utf-8") as f:
+        f.write("INSIGHTS\n")
+        for b in llm_block["insights"]:
+            f.write(f"- {b}\n")
+        f.write("\nLIMITATIONS\n")
+        f.write(llm_block["limitations"])
+    print(f"\nReport saved to: {report_path}")
+
+import os
+os.environ["GEMINI_API_KEY"] = "AIzaSyCBweLlU-1RADO5nt5yPo-RTwLvWQXRQx0"
+
+run_india_population_eda()
