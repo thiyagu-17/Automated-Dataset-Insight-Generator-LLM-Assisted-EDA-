@@ -1,0 +1,12 @@
+INSIGHTS
+- Dataset Scale and Structure:** The dataset consists of 3,708 rows and 14 columns, primarily focused on demographic distributions across rural and urban areas.
+- Data Completeness:** The dataset is high-quality with zero duplicate rows. Most columns are 100% complete, except for the "Age" column, which has 108 missing values (approximately 2.91%).
+- Extreme Population Variance:** There is massive skewness in the population data. While the median for "Total Persons" is 51,135, the maximum value reaches 1,210,854,977, indicating the dataset includes aggregated national or state-level totals alongside more granular data.
+- Rural vs. Urban Distribution:** On average, the rural population is significantly larger than the urban population, with a mean of 899,405 Rural Persons compared to 406,802 Urban Persons.
+- Gender Gap:** The data shows a higher average count of males compared to females across the dataset, with a mean of 672,351 Total Males versus 633,856 Total Females.
+- Constant Variables:** The "Distt." (District) column is a constant value (0.0) across all 3,708 rows, meaning it currently provides no analytical value or variance for distinguishing between different districts.
+- Age Demographics:** For the records where age is present, the values range from 0 to 99 years, with a mean and median of 49.5, suggesting a uniform or balanced distribution of age-related entries in the source tables.
+- Presence of Outliers:** All population-related columns (Total, Rural, and Urban) exhibit a high number of outliers (ranging from 426 to 478 per column), further confirming that the dataset combines small-area data with high-level aggregates.
+
+LIMITATIONS
+Based on the Exploratory Data Analysis (EDA) provided in the JSON, here are the key insights and limitations: ### **Key Insights** ### **Limitations and Potential Bias** The most significant limitation is the "Distt." column, which is constant at 0, preventing any district-level geographical analysis. Additionally, the extreme disparity between the median and maximum values suggests that national, state, and possibly sub-district totals are all contained within the same columns; if analyzed without filtering by the "Table" or "Area Name" categories, this would lead to massive double-counting and an overestimation of the actual population. There is also a slight gender representation bias in the mean values, and the 2.91% missingness in the "Age" column may slightly skew demographic profiles if those missing records are not distributed randomly.
